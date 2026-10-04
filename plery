@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""plery - 随身 WiFi (192.168.43.1) 管理命令行工具.
+
+设备接口: ZTE 风格 /reqproc (proc_get / proc_post), 会话按来源 IP.
+配置与密码: ~/.config/plery/config.json (0600).
+"""
+
+import argparse
+import base64
+import json
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".config" / "plery" / "config.json"
+DEFAULT_HOST = "192.168.43.1"
+TIMEOUT = 8
+
+
+# ---------- config ----------
+
+def load_config():
+    """读取配置; 不存在则用默认 host, 密码为空."""
+    if CONFIG_PATH.exists():
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    else:
+        data = {}
+    return {
+        "host": data.get("host", DEFAULT_HOST),
+        "password": data.get("password", ""),
+    }
+
+
+def save_config(cfg):
+    """写回配置, 权限 0600."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    CONFIG_PATH.chmod(0o600)
+
+
+# ---------- device client ----------
+
+class DeviceError(Exception):
+    """设备不可达或返回错误."""
+
+
+class Mifi:
+    def __init__(self, host, password):
+        self.host = host
+        self.password = password
+        self.base = f"http://{host}"
+        # 绕过系统代理 (127.0.0.1:7890 会把设备请求代理成 502)
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({})
+        )
+
+    def _request(self, url, data=None):
+        req = urllib.request.Request(url, data=data)
+        try:
+            with self.opener.open(req, timeout=TIMEOUT) as resp:
+                return resp.read().decode("utf-8", "replace")
+        except (urllib.error.URLError, OSError) as e:
+            raise DeviceError(f"设备不可达 ({self.host}): {e}") from e
+
+    def get(self, cmd, multi=True):
+        """proc_get 查询; 返回字段->值的 dict. multi_data=1 必加, 否则多字段返回空."""
+        q = cmd if "&" in cmd else f"cmd={urllib.parse.quote(cmd)}"
+        if multi:
+            q += "&multi_data=1"
+        text = self._request(f"{self.base}/reqproc/proc_get?{q}")
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise DeviceError(f"响应非 JSON: {text[:120]}") from e
+        # 会话过期: 请求的每个字段都返回空串
+        if multi and result and all(
+            v == "" for k, v in result.items() if k not in ("result", "cmd")
+        ):
+            return None
+        return result
+
+    def post(self, form):
+        """proc_post 写入; form 为 dict. 返回响应 dict."""
+        body = urllib.parse.urlencode(form).encode()
+        text = self._request(f"{self.base}/reqproc/proc_post", data=body)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            raise DeviceError(f"响应非 JSON: {text[:120]}") from e
+
+    def login(self):
+        """登录 (密码 Base64). result 0/4 均为成功."""
+        r = self.post({"goformId": "LOGIN",
+                       "password": base64.b64encode(self.password.encode()).decode()})
+        if r.get("result") in ("0", "4"):
+            return True
+        raise DeviceError(f"登录失败: {r}")
+
+    def ensure_login(self):
+        """探测会话; 过期则登录. 密码未配置时报错."""
+        if not self.password:
+            raise DeviceError(
+                f"未配置密码: 编辑 {CONFIG_PATH} 加入 {{\"password\": \"...\"}}"
+            )
+        return True
+
+    def query(self, cmd):
+        """需登录态的查询: 过期自动重登录后重试一次."""
+        result = self.get(cmd)
+        if result is None:
+            self.login()
+            result = self.get(cmd)
+            if result is None:
+                raise DeviceError("重登录后查询仍为空, 字段可能不受支持")
+        return result
+
+    def action(self, form):
+        """需登录态的写入: 先登录再提交, 校验 result."""
+        self.ensure_login()
+        self.login()
+        r = self.post(form)
+        ok = r.get("result") in ("0", "4", "success")
+        return ok, r
+
+
+# ---------- output helpers ----------
+
+def emit(data, as_json):
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False))
+    else:
+        for k, v in data.items():
+            print(f"{k}: {v}")
+
+
+def fail(msg):
+    print(f"错误: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------- commands ----------
+
+def cmd_login(args, client):
+    if not client.password:
+        fail(f"未配置密码: 编辑 {CONFIG_PATH}")
+    client.login()
+    print("登录成功")
+
+
+def cmd_logout(args, client):
+    ok, r = client.action({"goformId": "LOGOUT"})
+    print("登出成功" if ok else f"登出响应: {r}")
+
+
+STATUS_FIELDS = (
+    "signal_strength,rssi,rsrp,network_type,network_provider,wan_ipaddr,"
+    "ppp_status,modem_main_state,sim_card_sole,sim_switch_mode,sim_card_current,"
+    "wifi_cur_state,SSID1,battery_level,battery_charging"
+)
+
+
+def cmd_status(args, client):
+    data = client.query(STATUS_FIELDS)
+    emit(data, args.json)
+
+
+TRAFFIC_FIELDS = "monthly_rx_bytes,monthly_tx_bytes,monthly_time"
+
+
+def cmd_traffic(args, client):
+    data = client.query(TRAFFIC_FIELDS)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False))
+        return
+    rx = int(data.get("monthly_rx_bytes") or 0)
+    tx = int(data.get("monthly_tx_bytes") or 0)
+    secs = int(data.get("monthly_time") or 0)
+
+    def gib(n):
+        return n / 1024**3
+
+    hours = secs / 3600
+    print(f"月下载: {rx:,} B ({gib(rx):.1f} GiB)")
+    print(f"月上传: {tx:,} B ({gib(tx):.1f} GiB)")
+    print(f"月合计: {gib(rx + tx):.1f} GiB")
+    print(f"在线时长: {hours:.1f} 小时")
+
+
+LIMIT_FIELDS = (
+    "data_volume_limit_switch,data_volume_limit_unit,"
+    "data_volume_limit_size,data_volume_alert_percent"
+)
+
+
+def cmd_limit(args, client):
+    if args.limit_cmd == "set":
+        size = f"{args.size}_1024"  # 1024 系数 = GB
+        form = {
+            "goformId": "DATA_LIMIT_SETTING",
+            "data_volume_limit_switch": "1" if args.on else "0",
+            "data_volume_limit_unit": "data",
+            "data_volume_limit_size": size,
+            "data_volume_alert_percent": str(args.alert),
+        }
+        ok, r = client.action(form)
+        if ok:
+            print(f"流量限额已设为 {args.size} GB/月, 提醒 {args.alert}%, "
+                  f"{'启用' if args.on else '停用'}")
+        else:
+            fail(f"设置失败: {r}")
+        return
+    data = client.query(LIMIT_FIELDS)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False))
+        return
+    sw = data.get("data_volume_limit_switch")
+    unit = data.get("data_volume_limit_unit")
+    raw_size = data.get("data_volume_limit_size") or ""
+    alert = data.get("data_volume_alert_percent")
+    size_num, _, coef = raw_size.partition("_")
+    size_gb = int(size_num or 0) * int(coef or 1) / 1024 if coef == "1024" else raw_size
+    print(f"限额: {'启用' if sw == '1' else '停用'}")
+    print(f"类型: {unit}")
+    print(f"大小: {size_gb}")
+    print(f"提醒: {alert}%")
+
+
+WIFI_FIELDS = "wifi_cur_state,SSID1,AuthMode,EncrypType,wifi_band"
+
+
+def cmd_wifi(args, client):
+    sub = args.wifi_cmd
+    if sub == "show":
+        data = client.query(WIFI_FIELDS)
+        emit(data, args.json)
+        return
+    if sub == "password":
+        form = {
+            "goformId": "SET_WIFI_SECURITY_INFO",
+            "AuthMode": "WPAPSK",
+            "AuthMode_5g": "WPAPSK",
+            "passPhrase": base64.b64encode(args.value.encode()).decode(),
+            "passPhrase_5g": base64.b64encode(args.value.encode()).decode(),
+            "wifi_wps_index": "1",
+        }
+        ok, r = client.action(form)
+        print("WiFi 密码已更新" if ok else f"设置失败: {r}")
+        if not ok:
+            sys.exit(1)
+        return
+    if sub == "coverage":
+        form = {"goformId": "SET_WIFI_COVERAGE", "wifi_coverage": args.value + "_mode"}
+        ok, r = client.action(form)
+        print(f"覆盖已设为 {args.value}" if ok else f"设置失败: {r}")
+        if not ok:
+            sys.exit(1)
+        return
+    if sub == "sleep":
+        form = {"goformId": "SET_WIFI_SLEEP_INFO",
+                "sysIdleTimeToSleep": str(args.minutes)}
+        ok, r = client.action(form)
+        print(f"WiFi 休眠已设为 {args.minutes} 分钟"
+              if ok else f"设置失败: {r}")
+        if not ok:
+            sys.exit(1)
+        return
+    fail(f"未知子命令: {sub}")
+
+
+DEVICE_FIELDS = "battery_level,battery_charging,power_save_mode"
+
+
+def cmd_device(args, client):
+    sub = args.device_cmd
+    if sub == "reboot":
+        ok, r = client.action({"goformId": "REBOOT_DEVICE", "goformId_cmd": "1"})
+        print("重启指令已提交" if ok else f"失败: {r}")
+        if not ok:
+            sys.exit(1)
+        return
+    if sub == "shutdown":
+        ok, r = client.action({"goformId": "TURN_OFF_DEVICE"})
+        print("关机指令已提交" if ok else f"失败: {r}")
+        if not ok:
+            sys.exit(1)
+        return
+    if sub == "info":
+        data = client.query(DEVICE_FIELDS)
+        emit(data, args.json)
+        return
+    fail(f"未知子命令: {sub}")
+
+
+TSW_FIELDS = "openEnable,closeEnable,openTime,closeTime"
+
+
+def cmd_tsw(args, client):
+    if args.tsw_cmd == "set":
+        on_h, _, on_m = args.on.partition(":")
+        off_h, _, off_m = args.off.partition(":")
+        form = {
+            "goformId": "SAVE_TSW",
+            "openEnable": "1",
+            "closeEnable": "1",
+            "openTime": f"{int(on_h):02d};{int(on_m):02d}",
+            "closeTime": f"{int(off_h):02d};{int(off_m):02d}",
+        }
+        ok, r = client.action(form)
+        print(f"定时开关机已设为 开机 {args.on} / 关机 {args.off}"
+              if ok else f"设置失败: {r}")
+        if not ok:
+            sys.exit(1)
+        return
+    if args.tsw_cmd == "off":
+        ok, r = client.action({"goformId": "SAVE_TSW",
+                               "openEnable": "0", "closeEnable": "0",
+                               "openTime": "00;00", "closeTime": "00;00"})
+        print("定时开关机已关闭" if ok else f"设置失败: {r}")
+        if not ok:
+            sys.exit(1)
+        return
+    data = client.query(TSW_FIELDS)
+    emit(data, args.json)
+
+
+def cmd_raw(args, client):
+    if args.post:
+        form = dict(urllib.parse.parse_qsl(args.post))
+        print(json.dumps(client.post(form), ensure_ascii=False))
+        return
+    print(json.dumps(client.get(args.expr), ensure_ascii=False))
+
+
+# ---------- parser ----------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="plery", description="随身 WiFi 管理 CLI")
+    p.add_argument("--host", help="设备地址 (默认取 config)")
+    p.add_argument("--json", action="store_true", help="输出原始 JSON")
+    sub = p.add_subparsers(dest="group", required=True)
+
+    login = sub.add_parser("login", help="登录设备")
+    login.add_argument("--password", help="密码 (写入 config)")
+    login.set_defaults(fn=cmd_login)
+
+    logout = sub.add_parser("logout", help="登出设备")
+    logout.set_defaults(fn=cmd_logout)
+
+    st = sub.add_parser("status", help="状态一览")
+    st.set_defaults(fn=cmd_status)
+
+    tr = sub.add_parser("traffic", help="流量用量")
+    tr.set_defaults(fn=cmd_traffic)
+
+    limit = sub.add_parser("limit", help="流量限额")
+    limit.add_argument("limit_cmd", choices=["show", "set"], nargs="?",
+                       default="show")
+    limit.add_argument("--size", type=int, help="每月 GB")
+    limit.add_argument("--alert", type=int, default=90, help="提醒百分比")
+    limit.add_argument("--on", action="store_true", default=True)
+    limit.add_argument("--off", dest="on", action="store_false")
+    limit.set_defaults(fn=cmd_limit)
+
+    wifi = sub.add_parser("wifi", help="WiFi 设置")
+    wifi.add_argument("wifi_cmd", choices=["show", "password", "coverage", "sleep"])
+    wifi.add_argument("value", nargs="?", help="password: 新密码 / coverage: 等级")
+    wifi.add_argument("--minutes", type=int, help="sleep: 分钟数 (0=不休眠)")
+    wifi.set_defaults(fn=cmd_wifi)
+
+    dev = sub.add_parser("device", help="设备控制")
+    dev.add_argument("device_cmd", choices=["info", "reboot", "shutdown"])
+    dev.set_defaults(fn=cmd_device)
+
+    tsw = sub.add_parser("tsw", help="定时开关机")
+    tsw.add_argument("tsw_cmd", choices=["show", "set", "off"], nargs="?",
+                     default="show")
+    tsw.add_argument("--on", help="开机时间 HH:MM")
+    tsw.add_argument("--off", help="关机时间 HH:MM")
+    tsw.set_defaults(fn=cmd_tsw)
+
+    raw = sub.add_parser("raw", help="直接调设备接口")
+    raw.add_argument("expr", help='查询串, 如 "cmd=monthly_rx_bytes&multi_data=1"')
+    raw.add_argument("--post", help='写入串, 如 "goformId=LOGOUT"')
+    raw.set_defaults(fn=cmd_raw)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    cfg = load_config()
+    if args.host:
+        cfg["host"] = args.host
+    # login --password 持久化
+    if args.group == "login" and args.password:
+        cfg["password"] = args.password
+        save_config(cfg)
+    client = Mifi(cfg["host"], cfg["password"])
+    try:
+        args.fn(args, client)
+    except DeviceError as e:
+        fail(e)
+
+
+if __name__ == "__main__":
+    main()
