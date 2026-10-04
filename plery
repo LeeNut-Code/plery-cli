@@ -449,11 +449,11 @@ BANNER = r"""       _
 
 def build_parser():
     p = argparse.ArgumentParser(prog="plery", description="随身 WiFi 管理 CLI")
-    p.add_argument("--version", action="version",
-                   version=f"{BANNER}\n\nplery {VERSION}")
+    # argparse version action 会把换行折叠成空格, 改用 store_true + 手动 print
+    p.add_argument("--version", action="store_true", help="显示版本")
     p.add_argument("--host", help="设备地址 (默认取 config)")
     p.add_argument("--json", action="store_true", help="输出原始 JSON")
-    sub = p.add_subparsers(dest="group", required=True)
+    sub = p.add_subparsers(dest="group")
 
     login = sub.add_parser("login", help="登录设备")
     login.add_argument("--password", help="密码 (写入 config)")
@@ -519,6 +519,13 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    if args.version:
+        print(BANNER)
+        print(f"\nplery {VERSION}")
+        sys.exit(0)
+    if not getattr(args, "group", None):
+        build_parser().print_help()
+        sys.exit(0)
     cfg = load_config()
     if args.host:
         cfg["host"] = args.host
