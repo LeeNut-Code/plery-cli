@@ -27,10 +27,17 @@ ln -sf "$(pwd)/plery" ~/.local/bin/plery
 
 | 命令 | 说明 |
 |---|---|
+| `plery --version` | 版本（当前 1.0） |
 | `plery login [--password XXX]` | 登录（密码持久化到 config） |
 | `plery logout` | 登出 |
 | `plery status` | 状态一览：信号/网络/SIM/WiFi/电池 |
 | `plery traffic` | 月用量 + 在线时长 |
+| `plery devices` | 已连设备列表（MAC/IP/主机名/类型） |
+| `plery net on\|off` | 连接/断开网络（实测可用） |
+| `plery macfilter show` | MAC 过滤模式 + 黑白名单 |
+| `plery macfilter add MAC [--mode 1\|2]` | 加入名单（默认按当前模式：白1/黑2） |
+| `plery macfilter del MAC` | 从黑白名单移除 |
+| `plery macfilter mode 0\|1\|2` | 设过滤模式（0=关 1=白名单 2=黑名单） |
 | `plery limit show` | 查看流量限额 |
 | `plery limit set --size 205 [--alert 90] [--off]` | 设置限额（GB/月，默认启用） |
 | `plery wifi show` | WiFi 状态（SSID/加密/频段） |
@@ -43,7 +50,7 @@ ln -sf "$(pwd)/plery" ~/.local/bin/plery
 | `plery tsw show` | 定时开关机状态 |
 | `plery tsw set --on HH:MM --off HH:MM` | 设置定时开关机 |
 | `plery tsw off` | 关闭定时开关机 |
-| `plery raw 'cmd=字段&multi_data=1'` | 直接 GET（逃生舱） |
+| `plery raw 'cmd=字段&multi_data=1'` | 直接 GET（逃生舱，`cmd=` 开头 verbatim） |
 | `plery raw --post 'goformId=XXX&参数'` | 直接 POST |
 
 全局 `--json`：输出原始 API JSON（供脚本/自动化复用）。
@@ -55,7 +62,7 @@ ln -sf "$(pwd)/plery" ~/.local/bin/plery
 
 ## 验证
 
-读命令与无害等幂写命令（`limit set --size 205`、`wifi coverage medium`、`wifi sleep --minutes 10`、`tsw set/off`）已对真机实测通过；`device reboot/shutdown`、`wifi password` 为破坏性操作，只实现未执行。
+读命令与无害等幂写命令（`limit set --size 205`、`wifi coverage medium`、`wifi sleep --minutes 10`、`tsw set/off`、`macfilter add/del/mode` 回环后恢复原状）已对真机实测通过；`net on/off` 断网/重连实测可用（ppp_status 确认）；`device reboot/shutdown`、`wifi password` 为破坏性操作，只实现未执行。
 
 ## 已知限制
 

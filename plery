@@ -329,6 +329,103 @@ def cmd_tsw(args, client):
     emit(data, args.json)
 
 
+def cmd_devices(args, client):
+    """已连设备列表: station_list 不加 multi_data 才返回数组."""
+    text = client._request(f"{client.base}/reqproc/proc_get?cmd=station_list")
+    data = json.loads(text)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False))
+        return
+    stations = data.get("station_list") or []
+    if not stations:
+        print("无已连设备")
+        return
+    for s in stations:
+        host = s.get("hostname") or "--"
+        ip = s.get("ip_addr") or "--"
+        print(f"{s.get('mac_addr', '?')}  {ip:<15}  {host}  ({s.get('dev_type', '?')})")
+
+
+def cmd_net(args, client):
+    if args.net_cmd == "on":
+        ok, r = client.action({"goformId": "CONNECT_NETWORK"})
+        print("连接指令已提交" if ok else f"失败: {r}")
+        if not ok:
+            sys.exit(1)
+        return
+    ok, r = client.action({"goformId": "DISCONNECT_NETWORK"})
+    print("断网指令已提交" if ok else f"失败: {r}")
+    if not ok:
+        sys.exit(1)
+
+
+ACL_FIELDS = (
+    "ACL_mode,wifi_mac_black_list,wifi_hostname_black_list,"
+    "wifi_mac_white_list,wifi_cur_state,user_ip_addr,client_mac_address"
+)
+
+
+def cmd_macfilter(args, client):
+    sub = args.mac_cmd
+    if sub == "add":
+        # 按当前 ACL 模式追加: 白名单模式(1)写 white, 其余写 black (与 UI 行为一致)
+        info = client.query(ACL_FIELDS)
+        mode = "1" if info.get("ACL_mode") == "1" else "2"
+        key = "wifi_mac_white_list" if mode == "1" else "wifi_mac_black_list"
+        cur = [m for m in (info.get(key) or "").split(";") if m]
+        mac = args.mac.upper()
+        if mac in cur:
+            print(f"{mac} 已在名单中")
+            return
+        cur.append(mac)
+        form = {"goformId": "WIFI_MAC_FILTER", "ACL_mode": mode, key: ";".join(cur)}
+        ok, r = client.action(form)
+        print(f"{mac} 已加入{'白' if mode == '1' else '黑'}名单" if ok else f"失败: {r}")
+        if not ok:
+            sys.exit(1)
+        return
+    if sub == "del":
+        info = client.query(ACL_FIELDS)
+        mac = args.mac.upper()
+        changed = False
+        form = {"goformId": "WIFI_MAC_FILTER", "ACL_mode": info.get("ACL_mode") or "0"}
+        for key in ("wifi_mac_black_list", "wifi_mac_white_list"):
+            cur = [m for m in (info.get(key) or "").split(";") if m]
+            if mac in cur:
+                cur.remove(mac)
+                form[key] = ";".join(cur)
+                changed = True
+        if not changed:
+            print(f"{mac} 不在任何名单中")
+            return
+        ok, r = client.action(form)
+        print(f"{mac} 已移出名单" if ok else f"失败: {r}")
+        if not ok:
+            sys.exit(1)
+        return
+    if sub == "mode":
+        if not args.mac:
+            print("用法: plery macfilter mode 0|1|2", file=sys.stderr)
+            sys.exit(1)
+        form = {"goformId": "WIFI_MAC_FILTER", "ACL_mode": args.mac}
+        ok, r = client.action(form)
+        label = {"0": "关闭", "1": "白名单", "2": "黑名单"}[args.mac]
+        print(f"MAC 过滤模式已设为 {label}" if ok else f"失败: {r}")
+        if not ok:
+            sys.exit(1)
+        return
+    # show
+    data = client.query(ACL_FIELDS)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False))
+        return
+    mode = data.get("ACL_mode")
+    label = {"0": "关闭", "1": "白名单", "2": "黑名单"}.get(mode, mode)
+    print(f"模式: {label}")
+    print(f"黑名单: {data.get('wifi_mac_black_list') or '(空)'}")
+    print(f"白名单: {data.get('wifi_mac_white_list') or '(空)'}")
+
+
 def cmd_raw(args, client):
     if args.post:
         form = dict(urllib.parse.parse_qsl(args.post))
@@ -341,6 +438,7 @@ def cmd_raw(args, client):
 
 def build_parser():
     p = argparse.ArgumentParser(prog="plery", description="随身 WiFi 管理 CLI")
+    p.add_argument("--version", action="version", version="1.0")
     p.add_argument("--host", help="设备地址 (默认取 config)")
     p.add_argument("--json", action="store_true", help="输出原始 JSON")
     sub = p.add_subparsers(dest="group", required=True)
@@ -383,6 +481,21 @@ def build_parser():
     tsw.add_argument("--on", help="开机时间 HH:MM")
     tsw.add_argument("--off", help="关机时间 HH:MM")
     tsw.set_defaults(fn=cmd_tsw)
+
+    dev_list = sub.add_parser("devices", help="已连设备列表")
+    dev_list.set_defaults(fn=cmd_devices)
+
+    net = sub.add_parser("net", help="网络连接开关")
+    net.add_argument("net_cmd", choices=["on", "off"])
+    net.set_defaults(fn=cmd_net)
+
+    mac = sub.add_parser("macfilter", help="无线 MAC 过滤")
+    mac.add_argument("mac_cmd", choices=["show", "add", "del", "mode"],
+                     nargs="?", default="show")
+    mac.add_argument("mac", nargs="?", help="add/del: MAC 地址 / mode: 0=关 1=白名单 2=黑名单")
+    mac.add_argument("--mode", choices=["1", "2"],
+                     help="add: 1=白名单 2=黑名单 (默认按当前模式)")
+    mac.set_defaults(fn=cmd_macfilter)
 
     raw = sub.add_parser("raw", help="直接调设备接口")
     raw.add_argument("expr", help='查询串, 如 "cmd=monthly_rx_bytes&multi_data=1"')
