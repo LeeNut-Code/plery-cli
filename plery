@@ -66,8 +66,11 @@ class Mifi:
             raise DeviceError(f"设备不可达 ({self.host}): {e}") from e
 
     def get(self, cmd, multi=True):
-        """proc_get 查询; 返回字段->值的 dict. multi_data=1 必加, 否则多字段返回空."""
-        q = cmd if "&" in cmd else f"cmd={urllib.parse.quote(cmd)}"
+        """proc_get 查询; 返回字段->值的 dict. multi_data=1 必加, 否则多字段返回空.
+
+        raw 传入完整查询串 (含 &) 时 verbatim 使用, 不再拼 cmd= 前缀.
+        """
+        q = cmd if cmd.startswith("cmd=") or "&" in cmd else f"cmd={urllib.parse.quote(cmd)}"
         if multi:
             q += "&multi_data=1"
         text = self._request(f"{self.base}/reqproc/proc_get?{q}")
